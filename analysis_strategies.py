@@ -729,6 +729,9 @@ Keep professional, actionable, and under 600 words."""
                 
             except Exception as e:
                 self.logger.error(f"Claude SDK error: {e}")
+                self.logger.error(f"Error type: {type(e)}")
+                import traceback
+                self.logger.error(f"Full traceback: {traceback.format_exc()}")
                 raise Exception(f"Claude analysis failed: {str(e)}")
         
         # Run async query in sync context
