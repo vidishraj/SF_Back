@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from analysis_strategies import TicketAnalysisStrategy, KeywordAnalysisStrategy
+from analysis_strategies import TicketAnalysisStrategy, KeywordAnalysisStrategy, LLMAnalysisStrategy
 
 
 class TicketAnalyzer:
@@ -27,7 +27,7 @@ class TicketAnalyzer:
         # This allows us to easily add new strategies in the future
         self._strategies = {
             'keyword': KeywordAnalysisStrategy(),
-            # 'llm': LLMAnalysisStrategy(),  # Will be implemented next
+            'llm': LLMAnalysisStrategy(),
         }
         
         # Default strategy if none specified
