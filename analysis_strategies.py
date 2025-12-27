@@ -410,23 +410,10 @@ class LLMAnalysisStrategy(TicketAnalysisStrategy):
         """Initialize LLM analysis strategy with Claude SDK configuration."""
         self.logger = logging.getLogger(__name__)
         
-        # Configure Claude SDK options
-        # Using minimal turns for focused analysis and cost control
+        # Configure Claude SDK options with minimal system prompt
         self.claude_options = ClaudeAgentOptions(
             max_turns=1,
-            system_prompt="""You are an expert customer support analyst with years of experience 
-            in analyzing support tickets and generating insights for product management teams. 
-            Your role is to analyze customer support data and provide actionable insights that 
-            help improve customer satisfaction and product development priorities.
-            
-            Generate analysis reports that are:
-            - Professional and concise
-            - Focused on actionable insights
-            - Suitable for non-technical stakeholders
-            - Data-driven and objective
-            
-            Always format your response as structured text that can be easily read by 
-            product managers, customer support leaders, and executive teams."""
+            system_prompt="You are a support ticket analyst. Provide concise, actionable insights from ticket data. Keep responses brief and focused."
         )
     
     def analyze_tickets(self, tickets: List[Dict[str, Any]]) -> str:
@@ -454,18 +441,30 @@ class LLMAnalysisStrategy(TicketAnalysisStrategy):
             return "No tickets to analyze."
         
         try:
+            import time
+            start_time = time.time()
+            
             # Prepare ticket data for LLM analysis
-            # Anonymize sensitive information while preserving analytical value
             sanitized_tickets = self._prepare_tickets_for_analysis(tickets)
+            prep_time = time.time()
+            self.logger.info(f"Data preparation took: {prep_time - start_time:.2f} seconds")
             
             # Generate analysis prompt
             prompt = self._create_analysis_prompt(sanitized_tickets)
+            prompt_time = time.time()
+            self.logger.info(f"Prompt creation took: {prompt_time - prep_time:.2f} seconds")
+            self.logger.info(f"Prompt length: {len(prompt)} characters")
             
             # Call Claude SDK asynchronously
             analysis_result = self._call_claude_async(prompt)
+            claude_time = time.time()
+            self.logger.info(f"Claude API call took: {claude_time - prompt_time:.2f} seconds")
             
             # Post-process and format the result
             formatted_result = self._format_llm_response(analysis_result, len(tickets))
+            
+            total_time = time.time()
+            self.logger.info(f"Total LLM analysis time: {total_time - start_time:.2f} seconds")
             
             return formatted_result
             
@@ -476,35 +475,42 @@ class LLMAnalysisStrategy(TicketAnalysisStrategy):
     
     def _prepare_tickets_for_analysis(self, tickets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Prepare and sanitize tickets for LLM analysis.
-        
-        This method:
-        1. Removes or masks sensitive customer information
-        2. Extracts relevant fields for analysis
-        3. Limits data size to stay within token limits
-        
-        Privacy consideration: Customer IDs are anonymized but preserved
-        for counting unique customers. Actual customer data is not included
-        unless it's essential for analysis (e.g., conversation content).
+        Prepare tickets for LLM analysis with accurate message counting.
+        Processes ALL tickets without limits.
         """
         sanitized = []
         
+        # Calculate accurate message counts across all tickets for the prompt
+        self.total_customer_messages = 0
+        self.total_support_messages = 0
+        
+        for ticket in tickets:
+            conversation = ticket.get('conversation', [])
+            for msg in conversation:
+                if msg.get('sender') == 'customer':
+                    self.total_customer_messages += 1
+                elif msg.get('sender') == 'support':
+                    self.total_support_messages += 1
+        
         for i, ticket in enumerate(tickets):
-            # Anonymize customer ID while preserving uniqueness
-            customer_id = ticket.get('customer_id', f'customer_{i}')
-            anonymized_id = f"customer_{hash(customer_id) % 10000}"
+            conversation = ticket.get('conversation', [])
             
-            # Extract conversation summary (limit length for token efficiency)
-            conversation_summary = self._summarize_conversation(ticket.get('conversation', []))
+            # Count customer/support messages for this ticket
+            customer_msg_count = sum(1 for msg in conversation if msg.get('sender') == 'customer')
+            support_msg_count = sum(1 for msg in conversation if msg.get('sender') == 'support')
             
             sanitized_ticket = {
-                'ticket_id': ticket.get('id', i),
-                'created_at': ticket.get('created_at', ''),
-                'customer_id': anonymized_id,
+                'id': ticket.get('id', i),
                 'priority': ticket.get('priority', 'unknown'),
                 'status': ticket.get('status', 'unknown'),
-                'summary': ticket.get('summary', '')[:200],  # Limit summary length
-                'conversation_summary': conversation_summary
+                'summary': ticket.get('summary', '')[:200],  # Increased back to 200 chars
+                'msg_count': len(conversation),
+                'customer_msg_count': customer_msg_count,
+                'support_msg_count': support_msg_count,
+                'has_customer_escalation': any('urgent' in msg.get('message', '').lower() or 
+                                              'frustrated' in msg.get('message', '').lower() or
+                                              'asap' in msg.get('message', '').lower()
+                                             for msg in conversation if msg.get('sender') == 'customer')
             }
             
             sanitized.append(sanitized_ticket)
@@ -547,73 +553,77 @@ class LLMAnalysisStrategy(TicketAnalysisStrategy):
     
     def _create_analysis_prompt(self, tickets: List[Dict[str, Any]]) -> str:
         """
-        Create a structured prompt for Claude to analyze the tickets.
-        
-        The prompt is designed to:
-        1. Provide clear context about the analysis task
-        2. Include relevant ticket data in a structured format
-        3. Request specific types of insights
-        4. Guide the output format for consistency
+        Create a prompt that meets the specific assessment requirements.
+        Ensures the summary includes all required elements for weekly team review.
         """
-        tickets_json = json.dumps(tickets, indent=2)
+        # Calculate required statistics
+        total_tickets = len(tickets)
         
-        prompt = f"""Please analyze the following customer support tickets and generate a comprehensive weekly summary report for our product management and customer support leadership team.
+        # Status counts
+        open_tickets = sum(1 for t in tickets if t.get('status') == 'open')
+        resolved_tickets = sum(1 for t in tickets if t.get('status') == 'resolved')
+        
+        # Priority counts  
+        high_priority = sum(1 for t in tickets if t.get('priority') == 'high')
+        medium_priority = sum(1 for t in tickets if t.get('priority') == 'medium')
+        low_priority = sum(1 for t in tickets if t.get('priority') == 'low')
+        
+        # Use accurate message counts calculated during data preparation
+        customer_messages = getattr(self, 'total_customer_messages', 0)
+        support_messages = getattr(self, 'total_support_messages', 0)
+        
+        # Key tickets that need attention
+        key_tickets = []
+        for ticket in tickets:  # Check ALL tickets
+            if (ticket.get('priority') == 'high' or 
+                ticket.get('status') == 'open' or 
+                ticket.get('has_customer_escalation')):
+                key_tickets.append(f"#{ticket.get('id')}: {ticket.get('summary')[:80]}... [{ticket.get('priority')}/{ticket.get('status')}]")
+        
+        prompt = f"""Generate a WEEKLY SUPPORT SUMMARY for our product management and customer support team.
 
-TICKET DATA:
-{tickets_json}
+TICKET DATA ANALYSIS:
+- Total Tickets: {total_tickets}
+- Status: Open ({open_tickets}), Resolved ({resolved_tickets})
+- Priority: High ({high_priority}), Medium ({medium_priority}), Low ({low_priority})
+- Messages: {customer_messages} customer, {support_messages} support
+- Key Tickets Needing Attention: {len(key_tickets)} tickets
 
-ANALYSIS REQUIREMENTS:
-Please provide insights on the following areas:
+SAMPLE KEY TICKETS:
+{chr(10).join(key_tickets[:3])}
+
+REQUIRED SUMMARY FORMAT:
+Generate a professional weekly summary that MUST include:
 
 1. OVERVIEW STATISTICS
-   - Total tickets and unique customers
-   - Status and priority distribution
-   - Key volume metrics
+   - Total number of tickets: {total_tickets}
+   - Count by status (Open: {open_tickets}, Resolved: {resolved_tickets})
+   - Count by priority (High: {high_priority}, Medium: {medium_priority}, Low: {low_priority})
+   - Total messages (Customer: {customer_messages}, Support: {support_messages})
 
-2. ISSUE CATEGORIZATION
-   - Identify main issue types and themes
-   - Highlight emerging patterns or trends
-   - Note any recurring problems
+2. KEY TICKETS FOR ATTENTION
+   - Highlight 2-3 specific tickets that need team focus
+   - Explain why each ticket is important
+   - Include ticket numbers and brief descriptions
 
-3. CUSTOMER SENTIMENT ANALYSIS
-   - Overall sentiment trends
-   - Identify frustrated vs satisfied customers
-   - Note any escalating situations
+3. INSIGHTS & TRENDS
+   - Support trends and patterns
+   - Resolution rate analysis
+   - Customer satisfaction indicators
+   - Emerging issues or concerns
 
-4. PRIORITY ISSUES
-   - Highlight 2-3 tickets that require immediate attention
-   - Explain why these tickets are concerning
-   - Suggest specific actions
+4. RECOMMENDATIONS
+   - 2-3 specific action items for the team
+   - Priority focus areas for next week
 
-5. STRATEGIC INSIGHTS
-   - Root cause analysis of common issues
-   - Product improvement recommendations
-   - Process optimization suggestions
-   - Risk assessment (customer churn, reputation, etc.)
-
-6. ACTIONABLE RECOMMENDATIONS
-   - Specific steps for the coming week
-   - Resource allocation suggestions
-   - Prevention strategies
-
-FORMAT REQUIREMENTS:
-- Use clear headings and bullet points
-- Keep language professional but accessible
-- Focus on actionable insights over raw statistics
-- Include specific ticket references when relevant
-- Limit response to approximately 1500 words
-- Use emojis sparingly for visual organization
-
-Generate a report that a product manager or customer support director would find immediately useful for decision-making."""
+Target audience: Non-technical team members (product managers, customer support leaders)
+Keep professional, actionable, and under 600 words."""
         
         return prompt
     
     def _call_claude_async(self, prompt: str) -> str:
         """
-        Call Claude SDK asynchronously and collect the response.
-        
-        This method handles the async/await pattern required by the Claude SDK,
-        similar to the implementation in the example code provided.
+        Call Claude SDK without timeout limits for complete analysis.
         """
         output_text = ""
         
